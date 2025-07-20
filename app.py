@@ -1,14 +1,20 @@
 import os
+import time
 from flask import Flask, request, jsonify
 import requests
+from cachetools import TTLCache # --- FIX: Import the time-based cache
 
 app = Flask(__name__)
 
-# --- CHANGE THIS LINE ---
-# Base URL for Roblox Games API to get favoritedCount
-ROBLOX_GAMES_API_BASE_URL = "https://games.roblox.com/v1/games" # <-- THIS IS THE CORRECT ENDPOINT
+# --- FIX: Define our cache ---
+# TTLCache stands for "Time To Live Cache"
+# maxsize: The maximum number of universe IDs to store.
+# ttl: Time To Live in seconds. We'll store the like count for 300 seconds (5 minutes)
+#      before fetching a fresh copy from Roblox. This value is tunable.
+like_cache = TTLCache(maxsize=128, ttl=300)
 
-# --- The rest of your app.py remains the same ---
+ROBLOX_GAMES_API_BASE_URL = "https://games.roblox.com/v1/games"
+
 @app.route('/', methods=['GET'])
 def home():
     return "Welcome to the Roblox Game Likes Proxy! Use the /getGameLikes endpoint with a universeId. Example: /getGameLikes?universeId=1234567890"
@@ -20,25 +26,30 @@ def get_game_likes():
     if not universe_id:
         return jsonify({"error": "Missing 'universeId' query parameter."}), 400
 
-    try:
-        # Note: The endpoint itself expects 'universeIds', and the parameter should match.
-        # So the URL will be: https://games.roblox.com/v1/games?universeIds=12345
-        roblox_api_url = f"{ROBLOX_GAMES_API_BASE_URL}?universeIds={int(universe_id)}"
+    # --- FIX: Check the cache first ---
+    # Before making any API call, we check if we have a recent, valid result stored.
+    # The TTLCache automatically handles checking if the entry has expired.
+    if universe_id in like_cache:
+        cached_likes = like_cache[universe_id]
+        # Return the cached data immediately. This is extremely fast and makes no API call.
+        return jsonify({"likes": cached_likes, "cached": True}), 200
 
+    # --- If the data is not in the cache, we proceed to fetch it from Roblox ---
+    try:
+        roblox_api_url = f"{ROBLOX_GAMES_API_BASE_URL}?universeIds={int(universe_id)}"
         response = requests.get(roblox_api_url)
         response.raise_for_status()
-
         data = response.json()
 
         if data and "data" in data and len(data["data"]) > 0:
             game_info = data["data"][0]
-            # --- CHANGE THIS LINE ---
-            # Now we correctly get 'favoritedCount' from this endpoint's response
             favorited_count = game_info.get("favoritedCount")
             if favorited_count is not None:
-                return jsonify({"likes": favorited_count}), 200
+                # --- FIX: Store the successful result in the cache ---
+                # Before returning the data, we save it for the next 5 minutes.
+                like_cache[universe_id] = favorited_count
+                return jsonify({"likes": favorited_count, "cached": False}), 200
             else:
-                # This error should now be rare if the ID is valid
                 return jsonify({"error": "favoritedCount not found in Roblox API response (unexpected).", "api_response": data}), 500
         else:
             return jsonify({"error": "Game information not found or invalid response from Roblox API (data array empty/missing).", "api_response": data}), 404
